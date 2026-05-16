@@ -1,0 +1,445 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>FGAI — Abuse Detection</title>
+  <link rel="stylesheet" href="style.css"/>
+</head>
+<body>
+<div class="wrapper">
+
+  <!-- ── Header ── -->
+  <header>
+    <div class="logo-row">
+      <div class="logo-box">
+       <svg viewBox="0 0 24 24" fill="none">
+  <path d="M12 2L2 7l10 5 10-5-10-5z" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round"/>
+  <path d="M2 17l10 5 10-5" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M2 12l10 5 10-5" stroke="var(--accent)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
+      </div>
+      <h2>Multimodal Abuse Detection</h2>
+    </div>
+    <p class="tagline"> 4 LANGUAGES · XLM-RoBERTa + Hugging Face</p>
+  </header>
+
+  <!-- Server status -->
+  <div class="status-row">
+    <div class="dot" id="srv-dot"></div>
+    <span id="srv-label">Checking server…</span>
+  </div>
+
+  <!-- ── Card: Language ── -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-num">01</span>
+      <span class="card-title">Select Language Pair</span>
+    </div>
+    <div class="lang-grid">
+      <button class="lang-btn active" data-lang="hindi" data-stt="hi-IN" onclick="selectLang(this)">
+        <div class="lang-label">हि</div>
+        Hindi-EN
+      </button>
+      <button class="lang-btn" data-lang="tamil" data-stt="ta-IN" onclick="selectLang(this)">
+        <div class="lang-label">த</div>
+        Tamil-EN
+      </button>
+      
+      <button class="lang-btn" data-lang="kannada" data-stt="kn-IN" onclick="selectLang(this)">
+        <div class="lang-label">ಕ</div>
+        Kannada-EN
+      </button>
+      <button class="lang-btn" data-lang="malayalam" data-stt="ml-IN" onclick="selectLang(this)">
+        <div class="lang-label">മ</div>
+        Malayalam-EN
+      </button>
+    </div>
+    <p style="font-family:var(--mono);font-size:11px;color:var(--muted)">
+      Selected: <span id="lang-display" style="color:var(--accent)">Hindi-English</span>
+      &nbsp;·&nbsp; STT: <span id="stt-display" style="color:var(--accent)">hi-IN</span>
+    </p>
+  </div>
+
+  <!-- ── Card: Input ── -->
+  <div class="card">
+    <div class="card-head">
+      <span class="card-num">02</span>
+      <span class="card-title">Input</span>
+    </div>
+
+    <!-- Tabs -->
+    <div class="tabs">
+      <button class="tab-btn active" onclick="switchTab('text', this)">✎ &nbsp;Text Input</button>
+      <button class="tab-btn"        onclick="switchTab('speech', this)">🎙 &nbsp;Speech Input</button>
+    </div>
+
+    <!-- Text tab -->
+    <div class="tab-panel active" id="tab-text">
+      <textarea id="text-input"
+        placeholder="Type or paste code-mixed text here…  e.g. Yaar tu bahut bura hai, I hate you"></textarea>
+      <button class="go-btn" onclick="analyzeText()" style="margin-top:14px">
+        ▶ &nbsp; Analyze Text
+      </button>
+    </div>
+
+    <!-- Speech tab -->
+    <div class="tab-panel" id="tab-speech">
+
+      <!-- Mic -->
+      <div class="mic-zone" id="mic-zone">
+        <div class="mic-wrap" id="mic-wrap">
+          <div class="mic-ring"></div>
+          <button class="mic-btn" id="mic-btn" onclick="toggleRec()">
+            <svg viewBox="0 0 24 24" fill="none">
+              <path d="M12 2a4 4 0 0 1 4 4v6a4 4 0 0 1-8 0V6a4 4 0 0 1 4-4z" fill="#f1f1f1"/>
+              <path d="M5 11a7 7 0 0 0 14 0" stroke="#f1f1f1" stroke-width="1.5" stroke-linecap="round"/>
+              <line x1="12" y1="18" x2="12" y2="22" stroke="#f1f1f1" stroke-width="1.5" stroke-linecap="round"/>
+              <line x1="9"  y1="22" x2="15" y2="22" stroke="#f1f1f1" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <div class="timer" id="timer">00:00</div>
+        <p class="mic-hint" id="mic-hint">Click the microphone to start recording</p>
+      </div>
+
+      <div class="or">OR UPLOAD AUDIO</div>
+
+      <div class="upload-zone" id="upload-zone" onclick="document.getElementById('file-in').click()">
+        <input type="file" id="file-in" accept="audio/*" style="display:none" onchange="onFile(event)"/>
+        <p>Drop audio here or <b>browse files</b></p>
+        <p style="font-size:11px;margin-top:4px">WAV · MP3 · OGG · FLAC · M4A · WEBM</p>
+        <div class="file-badge" id="file-badge" style="display:none"></div>
+      </div>
+
+      <audio id="audio-preview" controls style="display:none"></audio>
+
+      <button class="go-btn" id="speech-btn" onclick="analyzeSpeech()" disabled>
+        ▶ &nbsp; Transcribe &amp; Analyze
+      </button>
+    </div>
+  </div>
+
+  <div class="err-bar" id="err-bar"></div>
+
+  <!-- ── Result panel ── -->
+  <div class="result-panel" id="result-panel">
+    <div class="result-top">
+      <span class="result-label">Detection Result</span>
+      <span id="result-time" style="font-family:var(--mono);font-size:11px;color:var(--muted)"></span>
+    </div>
+    <div class="result-body" id="result-body">
+      <p class="placeholder">Results will appear here after analysis…</p>
+    </div>
+    <div class="result-footer" id="result-footer" style="display:none"></div>
+  </div>
+
+</div><!-- /wrapper -->
+
+<script>
+  // Static GitHub Pages frontend using Hugging Face inference
+
+  // ── State ──────────────────────────────────────────────────────────────────
+  let selectedLang    = 'hindi';
+  let selectedSttLang = 'hi-IN';
+  let selectedLangName = 'Hindi-English';
+  let recognition = null;
+  let transcriptText = '';
+  let timerInt = null;
+  let t0 = null;
+  let isRec = false;
+
+  // ── Status / readiness ──────────────────────────────────────────────────────
+  function setStatus(text, statusClass) {
+    const dot = document.getElementById('srv-dot');
+    const lbl = document.getElementById('srv-label');
+    dot.className = 'dot ' + statusClass;
+    lbl.textContent = text;
+  }
+
+  async function checkStatus() {
+   try {
+  const res = await fetch('/health');
+  if (!res.ok) throw new Error();
+  setStatus('Backend connected', 'ok');
+} catch {
+  setStatus('Backend not reachable', 'warn');
+}
+  }
+
+  window.addEventListener('load', () => { checkStatus(); });
+
+  // ── Language selection ──────────────────────────────────────────────────────
+  function selectLang(btn) {
+    document.querySelectorAll('.lang-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    selectedLang     = btn.dataset.lang;
+    selectedSttLang  = btn.dataset.stt;
+    selectedLangName = btn.textContent.trim().replace(/\s+/g,' ');
+    document.getElementById('lang-display').textContent = selectedLangName;
+    document.getElementById('stt-display').textContent  = selectedSttLang;
+  }
+
+  // ── Tab switching ───────────────────────────────────────────────────────────
+  function switchTab(tab, btn) {
+    document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + tab).classList.add('active');
+    hideError();
+  }
+
+  // ── Timer ──────────────────────────────────────────────────────────────────
+  function tick() {
+    const e = Math.floor((Date.now() - t0) / 1000);
+    document.getElementById('timer').textContent =
+      String(Math.floor(e/60)).padStart(2,'0') + ':' + String(e%60).padStart(2,'0');
+  }
+
+  // ── Mic ────────────────────────────────────────────────────────────────────
+  function createSpeechRecognition() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) return null;
+
+    const recog = new SpeechRecognition();
+    recog.continuous = false;
+    recog.interimResults = false;
+    recog.lang = selectedSttLang;
+
+    recog.onresult = event => {
+      transcriptText = event.results[0][0].transcript || '';
+      if (transcriptText) {
+        setPreviewText(transcriptText);
+        document.getElementById('speech-btn').disabled = false;
+      }
+      stopSpeechVisuals();
+    };
+
+    recog.onerror = event => {
+      showError('Speech recognition error: ' + (event.error || 'unknown'));
+      stopSpeechVisuals();
+    };
+
+    recog.onend = () => {
+      if (isRec) stopSpeechVisuals();
+    };
+
+    return recog;
+  }
+
+  function toggleRec() {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      showError('Speech recognition is not supported in this browser.');
+      return;
+    }
+
+    if (!recognition) {
+      recognition = createSpeechRecognition();
+      if (!recognition) {
+        showError('Speech recognition could not be initialized.');
+        return;
+      }
+    }
+
+    if (!isRec) {
+      hideError();
+      transcriptText = '';
+      recognition.lang = selectedSttLang;
+      recognition.start();
+      isRec = true;
+      t0 = Date.now();
+      timerInt = setInterval(tick, 500);
+      document.getElementById('mic-btn').classList.add('recording');
+      document.getElementById('mic-wrap').classList.add('recording');
+      document.getElementById('mic-zone').classList.add('recording');
+      document.getElementById('timer').classList.add('recording');
+      const h = document.getElementById('mic-hint');
+      h.textContent = 'Listening… click to stop';
+      h.classList.add('recording');
+    } else {
+      recognition.stop();
+      stopSpeechVisuals();
+    }
+  }
+
+  function stopSpeechVisuals() {
+    if (timerInt) clearInterval(timerInt);
+    isRec = false;
+    ['mic-btn','mic-wrap','mic-zone','timer'].forEach(id =>
+      document.getElementById(id).classList.remove('recording'));
+    document.getElementById('timer').textContent = '00:00';
+    const h = document.getElementById('mic-hint');
+    h.textContent = 'Click the microphone to start recording';
+    h.classList.remove('recording');
+  }
+
+  // ── File upload ────────────────────────────────────────────────────────────
+  function onFile(e) {
+    showError('Audio file upload is not supported in static GitHub Pages mode. Use the microphone button.');
+    if (e && e.target) e.target.value = '';
+  }
+
+  function setPreviewText(text) {
+    const badge = document.getElementById('file-badge');
+    badge.style.display = 'inline-flex';
+    badge.innerHTML = `<svg width="12" height="12" viewBox="0 0 24 24" fill="none">
+      <path d="M9 12l2 2 4-4" stroke="#47ff8e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>${text}`;
+    document.getElementById('upload-zone').classList.add('has-file');
+    document.getElementById('audio-preview').style.display = 'none';
+  }
+
+  // ── Error ──────────────────────────────────────────────────────────────────
+  function showError(msg) {
+    const el = document.getElementById('err-bar');
+    el.textContent = '⚠  ' + msg; el.style.display = 'block';
+  }
+  function hideError() { document.getElementById('err-bar').style.display = 'none'; }
+
+  function renderResult(data) {
+    const body    = document.getElementById('result-body');
+    const footer  = document.getElementById('result-footer');
+    const topTime = document.getElementById('result-time');
+
+    topTime.textContent = new Date().toLocaleTimeString();
+
+    const isOffensive  = data.label_id === 1;
+    const badgeClass   = isOffensive ? 'offensive' : 'non-offensive';
+    const nonOffPct    = data.probs?.non_offensive ?? 0;
+    const offPct       = data.probs?.offensive     ?? 0;
+
+    // Show original text (transcript for speech, typed text for text input)
+    const displayText  = data.transcript || data.text || '';
+    const displayLabel = data.transcript ? 'Transcript' : 'Input Text';
+    const translation  = data.translation || '';
+
+    const inputBoxHTML = `
+      <div style="margin-bottom:20px">
+        <p class="transcript-label">${displayLabel}</p>
+        <div class="transcript-box">${displayText || '<em style="color:var(--border2)">—</em>'}</div>
+      </div>
+      <div style="margin-bottom:20px">
+        <p class="transcript-label">English Translation</p>
+        <div class="transcript-box" style="color:var(--muted);font-style:italic">${translation || '<em style="color:var(--border2)">Translation unavailable</em>'}</div>
+      </div>`;
+
+    body.innerHTML = `
+      ${inputBoxHTML}
+      <div class="verdict">
+        <div class="verdict-badge ${badgeClass}">${data.label}</div>
+        <div class="confidence-col">
+          <div class="conf-val">${data.confidence}%</div>
+          <div class="conf-sub">CONFIDENCE</div>
+        </div>
+      </div>
+      <div class="prob-bars">
+        <div class="prob-row">
+          <span class="prob-name">Non-offensive</span>
+          <div class="prob-track"><div class="prob-fill non-offensive" id="pf-safe"></div></div>
+          <span class="prob-pct">${nonOffPct}%</span>
+        </div>
+        <div class="prob-row">
+          <span class="prob-name">Offensive</span>
+          <div class="prob-track"><div class="prob-fill offensive" id="pf-off"></div></div>
+          <span class="prob-pct">${offPct}%</span>
+        </div>
+      </div>`;
+
+    // Animate bars
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        document.getElementById('pf-safe').style.width = nonOffPct + '%';
+        document.getElementById('pf-off').style.width  = offPct    + '%';
+      });
+    });
+
+    footer.style.display = 'flex'; footer.innerHTML = '';
+    [selectedLangName, data.language, 'XLM-RoBERTa + Hugging Face'].forEach(t => {
+      const s = document.createElement('span'); s.className = 'tag'; s.textContent = t;
+      footer.appendChild(s);
+    });
+  }
+
+  async function classifyText(text) {
+  const response = await fetch('/analyze-text', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      text: text,
+      language: selectedLang
+    })
+  });
+
+  const data = await response.json();
+
+  if (!response.ok) {
+    throw new Error(data.error || 'Server error');
+  }
+
+  return data;
+}
+
+  // ── Analyze text ───────────────────────────────────────────────────────────
+  async function analyzeText() {
+    const text = document.getElementById('text-input').value.trim();
+    if (!text) { showError('Please enter some text first.'); return; }
+    hideError(); setLoading();
+
+    try {
+      const result = await classifyText(text);
+      renderResult(result);
+    } catch (e) {
+      showError(e.message);
+      setIdle();
+    }
+  }
+
+  // ── Analyze speech ─────────────────────────────────────────────────────────
+  async function analyzeSpeech() {
+    if (!transcriptText) { showError('Record speech first.'); return; }
+    hideError(); setLoading();
+    const btn = document.getElementById('speech-btn');
+    btn.disabled = true; btn.textContent = 'Processing…';
+
+    try {
+      const response = await fetch('/analyze-speech', {
+  method: 'POST',
+  body: (() => {
+    const fd = new FormData();
+    fd.append('language', selectedLang);
+    fd.append('stt_language', selectedSttLang);
+    fd.append('transcript', transcriptText); // pass transcript
+    return fd;
+  })()
+});
+
+const data = await response.json();
+if (!response.ok) throw new Error(data.error || 'Server error');
+
+renderResult({ ...data, transcript: transcriptText });
+    } catch (e) {
+      showError(e.message);
+      setIdle();
+    } finally {
+      btn.disabled = false;
+      btn.innerHTML = '&#9654;&nbsp;&nbsp;Transcribe &amp; Analyze';
+    }
+  }
+
+  // ── Loading / idle states ──────────────────────────────────────────────────
+  function setLoading() {
+    document.getElementById('result-body').innerHTML =
+      '<div class="dots"><span></span><span></span><span></span></div>';
+    document.getElementById('result-footer').style.display = 'none';
+    document.getElementById('result-time').textContent = '';
+  }
+  function setIdle() {
+    document.getElementById('result-body').innerHTML =
+      '<p class="placeholder">Results will appear here after analysis…</p>';
+  }
+</script>
+</body>
+</html>
