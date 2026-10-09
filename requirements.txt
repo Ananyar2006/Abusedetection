@@ -1,6 +1,7 @@
 flask
 flask-cors
 requests
+gunicorn
 deep-translator
 transformers
 torch
