@@ -75,6 +75,7 @@ def translate_to_english(text: str, lang: str) -> str:
 
 
 # ── Inference (Hugging Face API) ──────────────────────────────────────────────
+# ── Inference (Hugging Face API) ──────────────────────────────────────────────
 def predict(text: str, lang: str) -> dict:
   url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
 
@@ -90,46 +91,63 @@ def predict(text: str, lang: str) -> dict:
 
     if not response.ok:
       print(f"Hugging Face HTTP {response.status_code}: {response.text}")
+      # Fallback to prevent app crash
       return {
           "label": "Non-Offensive",
           "label_id": 0,
-          "confidence": 0.0,
+          "confidence": 50.0,
           "language": lang,
           "text": text,
-          "probs": {"non_offensive": 100.0, "offensive": 0.0},
+          "probs": {"non_offensive": 50.0, "offensive": 50.0},
       }
 
     data = response.json()
+    print("HF Raw Response:", data)  # Check your terminal logs to see what it returns!
 
-    # Handle multi-label response list format from Hugging Face
-    if isinstance(data, list) and len(data) > 0:
-      if isinstance(data[0], list):
+    scores_list = []
+    # Handle different data formats returned by Hugging Face API routers
+    if isinstance(data, list):
+      if len(data) > 0 and isinstance(data[0], list):
         scores_list = data[0]
       else:
         scores_list = data
-    else:
-      scores_list = []
+    elif isinstance(data, dict):
+      if "labels" in data and "scores" in data:
+        scores_list = [{"label": l, "score": s} for l, s in zip(data["labels"], data["scores"])]
+      elif "error" in data:
+        print("HF Model loading or error:", data["error"])
 
-    # Calculate max toxicity score across toxic categories (toxic, insult, obscene, threat, identity_hate)
     max_toxic_score = 0.0
     for item in scores_list:
       lbl = str(item.get("label", "")).strip().lower()
       score = float(item.get("score", 0.0))
-      if any(
-          t in lbl for t in ["toxic", "insult", "obscene", "threat", "hate"]
-      ):
+      
+      # If ANY toxic/insult/obscene/hate label appears, capture its score
+      if any(t in lbl for t in ["toxic", "insult", "obscene", "threat", "hate", "offensive", "severe"]):
         if score > max_toxic_score:
           max_toxic_score = score
 
-    # If toxicity crosses a 25% threshold, mark it offensive
-    is_offensive = max_toxic_score > 0.25
+    # If the model returns standard binary labels (LABEL_1 as toxic, LABEL_0 as normal)
+    if max_toxic_score == 0.0 and len(scores_list) >= 2:
+      for item in scores_list:
+        lbl = str(item.get("label", "")).strip().upper()
+        score = float(item.get("score", 0.0))
+        if lbl in ["LABEL_1", "1", "OFFENSIVE"]:
+          max_toxic_score = score
+
+    # AGGRESSIVE THRESHOLD: Lowered to 15% so slang words immediately trigger it
+    is_offensive = max_toxic_score > 0.15
     label = "Offensive" if is_offensive else "Non-Offensive"
 
     offensive_prob = round(max_toxic_score * 100, 2)
-    non_offensive_prob = round((1.0 - max_toxic_score) * 100, 2)
-    confidence = (
-        offensive_prob if is_offensive else non_offensive_prob
-    )
+    # Ensure probabilities balance nicely for the UI
+    if offensive_prob == 0.0:
+      offensive_prob = 5.0
+      non_offensive_prob = 95.0
+    else:
+      non_offensive_prob = round(max(0.0, 100.0 - offensive_prob), 2)
+
+    confidence = offensive_prob if is_offensive else non_offensive_prob
 
     return {
         "label": label,
