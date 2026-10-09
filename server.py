@@ -1,79 +1,79 @@
+import logging
 import os
 import requests
-from flask import Flask, request, jsonify, send_from_directory
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 try:
-    from deep_translator import GoogleTranslator
-    TRANSLATOR_AVAILABLE = True
+  from deep_translator import GoogleTranslator
+
+  TRANSLATOR_AVAILABLE = True
 except ImportError:
-    TRANSLATOR_AVAILABLE = False
-    print("INFO: deep-translator not installed")
+  TRANSLATOR_AVAILABLE = False
+  print("INFO: deep-translator not installed")
 
 app = Flask(__name__, static_folder=".")
 CORS(app, origins="*")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
-HF_MODEL = "joeddav/xlm-roberta-large-xnli"
+# Use a true multilingual XLM-RoBERTa toxicity model supporting all target languages
+HF_MODEL = "unitary/multilingual-toxic-xlm-roberta"
 
-SARVAM_API_KEY       = os.environ.get("SARVAM_API_KEY", "")
+SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
-
-LABELS = ["Non-Offensive", "Offensive"]
 
 # ── Language codes ─────────────────────────────────────────────────────────────
 SARVAM_LANG_CODES = {
-    "hindi":     "hi-IN",
-    "tamil":     "ta-IN",
-    "kannada":   "kn-IN",
+    "hindi": "hi-IN",
+    "tamil": "ta-IN",
+    "kannada": "kn-IN",
     "malayalam": "ml-IN",
 }
 GOOGLE_LANG_CODES = {
-    "hindi":     "hi",
-    "tamil":     "ta",
-    "kannada":   "kn",
+    "hindi": "hi",
+    "tamil": "ta",
+    "kannada": "kn",
     "malayalam": "ml",
 }
 
+
 # ── Translation ────────────────────────────────────────────────────────────────
 def translate_to_english(text: str, lang: str) -> str:
+  # ── Sarvam API ─────────────────────────────────────────
+  try:
+    src_code = SARVAM_LANG_CODES.get(lang, "hi-IN")
+    resp = requests.post(
+        SARVAM_TRANSLATE_URL,
+        headers={
+            "api-subscription-key": SARVAM_API_KEY,
+            "Content-Type": "application/json",
+        },
+        json={
+            "input": text,
+            "source_language_code": src_code,
+            "target_language_code": "en-IN",
+        },
+        timeout=10,
+    )
+    data = resp.json()
+    translated = data.get("translated_text") or data.get("translation") or ""
+    if translated:
+      return translated
+  except Exception as e:
+    print("Sarvam translate error:", e)
 
-    # ── Sarvam API ─────────────────────────────────────────
+  # ── Fallback ───────────────────────────────────────────
+  if TRANSLATOR_AVAILABLE:
     try:
-        src_code = SARVAM_LANG_CODES.get(lang, "hi-IN")
-        resp = requests.post(
-            SARVAM_TRANSLATE_URL,
-            headers={
-                "api-subscription-key": SARVAM_API_KEY,
-                "Content-Type": "application/json",
-            },
-            json={
-                "input": text,
-                "source_language_code": src_code,
-                "target_language_code": "en-IN",
-            },
-            timeout=10,
-        )
-        data = resp.json()
-        translated = data.get("translated_text") or data.get("translation") or ""
-        if translated:
-            return translated
+      src_code = GOOGLE_LANG_CODES.get(lang, "auto")
+      return GoogleTranslator(source=src_code, target="en").translate(text)
     except Exception as e:
-        print("Sarvam translate error:", e)
+      print("Fallback translate error:", e)
 
-    # ── Fallback ───────────────────────────────────────────
-    if TRANSLATOR_AVAILABLE:
-        try:
-            src_code = GOOGLE_LANG_CODES.get(lang, "auto")
-            return GoogleTranslator(source=src_code, target="en").translate(text)
-        except Exception as e:
-            print("Fallback translate error:", e)
+  return ""
 
-    return ""
 
-# ── Inference (Hugging Face API) ──────────────────────────────────────────────
-# ── Inference (Hugging Face API) ──────────────────────────────────────────────
 # ── Inference (Hugging Face API) ──────────────────────────────────────────────
 def predict(text: str, lang: str) -> dict:
   url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
@@ -83,13 +83,7 @@ def predict(text: str, lang: str) -> dict:
       "Content-Type": "application/json",
   }
 
-  payload = {
-      "inputs": text,
-      "parameters": {
-          "candidate_labels": LABELS,
-          "hypothesis_template": "This example is {}.",
-      },
-  }
+  payload = {"inputs": text}
 
   try:
     response = requests.post(url, headers=headers, json=payload, timeout=30)
@@ -107,57 +101,45 @@ def predict(text: str, lang: str) -> dict:
 
     data = response.json()
 
-    # Handle model loading / cold start responses from Hugging Face
-    if isinstance(data, dict) and "error" in data:
-      print("HF API Error/Loading:", data["error"])
-      return {
-          "label": "Non-Offensive",
-          "label_id": 0,
-          "confidence": 0.0,
-          "language": lang,
-          "text": text,
-          "probs": {"non_offensive": 100.0, "offensive": 0.0},
-      }
+    # Handle multi-label response list format from Hugging Face
+    if isinstance(data, list) and len(data) > 0:
+      if isinstance(data[0], list):
+        scores_list = data[0]
+      else:
+        scores_list = data
+    else:
+      scores_list = []
 
-    labels = data.get("labels", [])
-    scores = data.get("scores", [])
+    # Calculate max toxicity score across toxic categories (toxic, insult, obscene, threat, identity_hate)
+    max_toxic_score = 0.0
+    for item in scores_list:
+      lbl = str(item.get("label", "")).strip().lower()
+      score = float(item.get("score", 0.0))
+      if any(
+          t in lbl for t in ["toxic", "insult", "obscene", "threat", "hate"]
+      ):
+        if score > max_toxic_score:
+          max_toxic_score = score
 
-    if not labels or not scores:
-      return {
-          "label": "Non-Offensive",
-          "label_id": 0,
-          "confidence": 0.0,
-          "language": lang,
-          "text": text,
-          "probs": {"non_offensive": 100.0, "offensive": 0.0},
-      }
+    # If toxicity crosses a 25% threshold, mark it offensive
+    is_offensive = max_toxic_score > 0.25
+    label = "Offensive" if is_offensive else "Non-Offensive"
 
-    score_map = {
-        str(l).strip().lower(): float(s) for l, s in zip(labels, scores)
-    }
-
-    offensive_score = score_map.get("offensive", 0.0)
-    non_offensive_score = score_map.get("non-offensive", 0.0)
-
-    # Fallback if keys differ slightly
-    if offensive_score == 0.0 and non_offensive_score == 0.0:
-      offensive_score = scores[1] if len(scores) > 1 else 0.0
-      non_offensive_score = scores[0] if len(scores) > 0 else 1.0
-
-    label = (
-        "Offensive" if offensive_score > non_offensive_score else "Non-Offensive"
+    offensive_prob = round(max_toxic_score * 100, 2)
+    non_offensive_prob = round((1.0 - max_toxic_score) * 100, 2)
+    confidence = (
+        offensive_prob if is_offensive else non_offensive_prob
     )
-    confidence = max(offensive_score, non_offensive_score) * 100
 
     return {
         "label": label,
-        "label_id": 1 if label == "Offensive" else 0,
-        "confidence": round(confidence, 2),
+        "label_id": 1 if is_offensive else 0,
+        "confidence": confidence,
         "language": lang,
         "text": text,
         "probs": {
-            "non_offensive": round(non_offensive_score * 100, 2),
-            "offensive": round(offensive_score * 100, 2),
+            "non_offensive": non_offensive_prob,
+            "offensive": offensive_prob,
         },
     }
 
@@ -171,57 +153,63 @@ def predict(text: str, lang: str) -> dict:
         "text": text,
         "probs": {"non_offensive": 100.0, "offensive": 0.0},
     }
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return send_from_directory(".", "index.html")
+  return send_from_directory(".", "index.html")
+
 
 @app.route("/style.css")
 def styles():
-    return send_from_directory(".", "style.css")
+  return send_from_directory(".", "style.css")
+
 
 @app.route("/health")
 def health():
-    return jsonify({
-        "status": "ok",
-        "hf_token_set": bool(HF_API_TOKEN),
-        "sarvam_key_set": bool(SARVAM_API_KEY),
-    })
+  return jsonify({
+      "status": "ok",
+      "hf_token_set": bool(HF_API_TOKEN),
+      "sarvam_key_set": bool(SARVAM_API_KEY),
+  })
+
 
 # ── Analyze text ──────────────────────────────────────────────────────────────
 @app.route("/analyze-text", methods=["POST"])
 def analyze_text():
-    data = request.get_json()
+  data = request.get_json()
 
-    text = data.get("text", "").strip()
-    lang = data.get("language", "hindi").lower()
+  text = data.get("text", "").strip()
+  lang = data.get("language", "hindi").lower()
 
-    if not text:
-        return jsonify({"error": "Text is empty"}), 400
+  if not text:
+    return jsonify({"error": "Text is empty"}), 400
 
-    result = predict(text, lang)
-    result["translation"] = translate_to_english(text, lang)
+  result = predict(text, lang)
+  result["translation"] = translate_to_english(text, lang)
 
-    return jsonify(result)
+  return jsonify(result)
+
 
 # ── Analyze speech (transcript-based) ─────────────────────────────────────────
 @app.route("/analyze-speech", methods=["POST"])
 def analyze_speech():
+  transcript = request.form.get("transcript", "").strip()
+  lang = request.form.get("language", "hindi").lower()
 
-    transcript = request.form.get("transcript", "").strip()
-    lang = request.form.get("language", "hindi").lower()
+  if not transcript:
+    return jsonify({"error": "No transcript provided"}), 400
 
-    if not transcript:
-        return jsonify({"error": "No transcript provided"}), 400
+  result = predict(transcript, lang)
+  result["transcript"] = transcript
+  result["translation"] = translate_to_english(transcript, lang)
 
-    result = predict(transcript, lang)
-    result["transcript"] = transcript
-    result["translation"] = translate_to_english(transcript, lang)
+  return jsonify(result)
 
-    return jsonify(result)
 
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
-    print(f"Server running on port {port}")
-    app.run(host="0.0.0.0", port=port)
+  port = int(os.environ.get("PORT", 10000))
+  print(f"Server running on port {port}")
+  app.run(host="0.0.0.0", port=port)
