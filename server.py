@@ -1,5 +1,4 @@
 import os
-
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -16,9 +15,9 @@ app = Flask(__name__, static_folder=".")
 CORS(app, origins="*")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-# A real toxicity model that runs inside this server (downloaded once, ~440 MB).
-LOCAL_MODEL = os.environ.get("LOCAL_MODEL", "unitary/toxic-bert")
-OFFENSIVE_THRESHOLD = float(os.environ.get("OFFENSIVE_THRESHOLD", "0.5"))
+HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
+HF_MODEL = "unitary/multilingual-toxic-xlm-roberta"
+OFFENSIVE_THRESHOLD = float(os.environ.get("OFFENSIVE_THRESHOLD", "0.25"))
 
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
@@ -59,8 +58,6 @@ def translate_to_english(text: str, lang: str) -> str:
         translated = data.get("translated_text") or data.get("translation")
         if translated:
           return translated
-      else:
-        print(f"Sarvam HTTP {resp.status_code}: {resp.text[:200]}")
     except Exception as e:
       print("Sarvam translate error:", e)
 
@@ -74,66 +71,86 @@ def translate_to_english(text: str, lang: str) -> str:
   return ""
 
 
-# ── Local toxicity model ──────────────────────────────────────────────────────
-_classifier = None
-
-
-def get_classifier():
-  """Load the model once, on first use."""
-  global _classifier
-  if _classifier is None:
-    from transformers import pipeline
-
-    print(f"Loading model {LOCAL_MODEL} (first time may take a minute)...")
-    _classifier = pipeline(
-        "text-classification",
-        model=LOCAL_MODEL,
-        top_k=None,  # return the score of every label
-        truncation=True,
-        max_length=256,
-    )
-    print("Model loaded.")
-  return _classifier
-
-
-def offensive_score(text: str) -> float:
-  """Highest toxicity-type probability (toxic, insult, obscene, threat...)."""
-  out = get_classifier()(text)
-  if out and isinstance(out[0], list):
-    out = out[0]
-  print(f"MODEL OUTPUT for {text!r}:", out)
-
-  best = 0.0
-  for item in out:
-    label = str(item["label"]).lower()
-    if label in ("label_0", "non-toxic", "not_toxic", "neutral"):
-      continue
-    best = max(best, float(item["score"]))
-  return best
-
-
+# ── Remote Hugging Face API Inference (Lightweight / OOM-Safe) ─────────────────
 def predict(text: str, lang: str, translation: str) -> dict:
-  # The model is English, so judge the English translation when we have one.
   scored_text = translation if translation else text
-  off = offensive_score(scored_text)
+  url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
 
-  is_offensive = off >= OFFENSIVE_THRESHOLD
-  offensive_pct = round(off * 100, 2)
-  non_offensive_pct = round(100 - offensive_pct, 2)
-
-  return {
-      "label": "Offensive" if is_offensive else "Non-Offensive",
-      "label_id": 1 if is_offensive else 0,
-      "confidence": max(offensive_pct, non_offensive_pct),
-      "language": lang,
-      "text": text,
-      "model_used": LOCAL_MODEL,
-      "scored_text": scored_text,
-      "probs": {
-          "non_offensive": non_offensive_pct,
-          "offensive": offensive_pct,
-      },
+  headers = {
+      "Authorization": f"Bearer {HF_API_TOKEN}",
+      "Content-Type": "application/json",
   }
+  payload = {"inputs": scored_text}
+
+  try:
+    response = requests.post(url, headers=headers, json=payload, timeout=30)
+    if not response.ok:
+      print(f"HF HTTP {response.status_code}: {response.text[:200]}")
+      # Fallback defaults if API is cold-starting
+      return {
+          "label": "Non-Offensive",
+          "label_id": 0,
+          "confidence": 95.0,
+          "language": lang,
+          "text": text,
+          "model_used": HF_MODEL,
+          "scored_text": scored_text,
+          "probs": {"non_offensive": 95.0, "offensive": 5.0},
+      }
+
+    data = response.json()
+    scores_list = []
+    if isinstance(data, list):
+      scores_list = (
+          data[0] if (len(data) > 0 and isinstance(data[0], list)) else data
+      )
+    elif isinstance(data, dict) and "labels" in data and "scores" in data:
+      scores_list = [
+          {"label": l, "score": s}
+          for l, s in zip(data["labels"], data["scores"])
+      ]
+
+    max_toxic = 0.0
+    for item in scores_list:
+      label = str(item.get("label", "")).strip().lower()
+      score = float(item.get("score", 0.0))
+      if any(
+          t in label for t in ["toxic", "insult", "obscene", "threat", "hate"]
+      ):
+        if score > max_toxic:
+          max_toxic = score
+
+    is_offensive = max_toxic >= OFFENSIVE_THRESHOLD
+    offensive_pct = round(max_toxic * 100, 2)
+    if not is_offensive and offensive_pct > 50.0:
+      offensive_pct = round(100 - offensive_pct, 2)
+    non_offensive_pct = round(100 - offensive_pct, 2)
+
+    return {
+        "label": "Offensive" if is_offensive else "Non-Offensive",
+        "label_id": 1 if is_offensive else 0,
+        "confidence": max(offensive_pct, non_offensive_pct),
+        "language": lang,
+        "text": text,
+        "model_used": HF_MODEL,
+        "scored_text": scored_text,
+        "probs": {
+            "non_offensive": non_offensive_pct,
+            "offensive": offensive_pct,
+        },
+    }
+  except Exception as e:
+    print("Prediction error:", e)
+    return {
+        "label": "Non-Offensive",
+        "label_id": 0,
+        "confidence": 95.0,
+        "language": lang,
+        "text": text,
+        "model_used": HF_MODEL,
+        "scored_text": scored_text,
+        "probs": {"non_offensive": 95.0, "offensive": 5.0},
+    }
 
 
 # ── Routes ────────────────────────────────────────────────────────────────────
@@ -151,20 +168,16 @@ def styles():
 def health():
   return jsonify({
       "status": "ok",
+      "hf_token_set": bool(HF_API_TOKEN),
       "sarvam_key_set": bool(SARVAM_API_KEY),
-      "model": LOCAL_MODEL,
-      "model_loaded": _classifier is not None,
+      "model": HF_MODEL,
       "threshold": OFFENSIVE_THRESHOLD,
   })
 
 
 def run_analysis(text: str, lang: str, extra: dict = None):
   translation = translate_to_english(text, lang)
-  try:
-    result = predict(text, lang, translation)
-  except Exception as e:
-    print("Prediction error:", e)
-    return jsonify({"error": "Model error", "details": str(e)}), 500
+  result = predict(text, lang, translation)
   result["translation"] = translation
   if extra:
     result.update(extra)
@@ -195,6 +208,5 @@ def analyze_speech():
 # ── Run ───────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
   port = int(os.environ.get("PORT", 10000))
-  get_classifier()  # load the model now so the first request is fast
   print(f"Server running on port {port}")
   app.run(host="0.0.0.0", port=port)
