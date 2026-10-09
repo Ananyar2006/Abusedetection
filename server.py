@@ -15,7 +15,7 @@ CORS(app, origins="*")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
-HF_MODEL = "unitary/multilingual-toxic-bert"
+HF_MODEL = "joeddav/xlm-roberta-large-xnli"
 
 SARVAM_API_KEY       = os.environ.get("SARVAM_API_KEY", "")
 SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
@@ -74,6 +74,7 @@ def translate_to_english(text: str, lang: str) -> str:
 
 # ── Inference (Hugging Face API) ──────────────────────────────────────────────
 # ── Inference (Hugging Face API) ──────────────────────────────────────────────
+# ── Inference (Hugging Face API) ──────────────────────────────────────────────
 def predict(text: str, lang: str) -> dict:
   url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
 
@@ -93,7 +94,6 @@ def predict(text: str, lang: str) -> dict:
   try:
     response = requests.post(url, headers=headers, json=payload, timeout=30)
 
-    # If Hugging Face returns an error code, catch it gracefully instead of crashing
     if not response.ok:
       print(f"Hugging Face HTTP {response.status_code}: {response.text}")
       return {
@@ -107,9 +107,9 @@ def predict(text: str, lang: str) -> dict:
 
     data = response.json()
 
-    # Handle cases where HF returns an error message dict instead of classification results
+    # Handle model loading / cold start responses from Hugging Face
     if isinstance(data, dict) and "error" in data:
-      print("HF API Error:", data["error"])
+      print("HF API Error/Loading:", data["error"])
       return {
           "label": "Non-Offensive",
           "label_id": 0,
@@ -122,26 +122,43 @@ def predict(text: str, lang: str) -> dict:
     labels = data.get("labels", [])
     scores = data.get("scores", [])
 
-    label = labels[0] if labels else "Non-Offensive"
-    confidence = round(scores[0] * 100, 2) if scores else 0
+    if not labels or not scores:
+      return {
+          "label": "Non-Offensive",
+          "label_id": 0,
+          "confidence": 0.0,
+          "language": lang,
+          "text": text,
+          "probs": {"non_offensive": 100.0, "offensive": 0.0},
+      }
 
-    probs = {"non_offensive": 0, "offensive": 0}
-    for i, lbl in enumerate(labels):
-      if i < len(scores):
-        val = round(scores[i] * 100, 2)
-        clean_lbl = str(lbl).strip().lower()
-        if "non" in clean_lbl:
-          probs["non_offensive"] = val
-        elif "offens" in clean_lbl:
-          probs["offensive"] = val
+    score_map = {
+        str(l).strip().lower(): float(s) for l, s in zip(labels, scores)
+    }
+
+    offensive_score = score_map.get("offensive", 0.0)
+    non_offensive_score = score_map.get("non-offensive", 0.0)
+
+    # Fallback if keys differ slightly
+    if offensive_score == 0.0 and non_offensive_score == 0.0:
+      offensive_score = scores[1] if len(scores) > 1 else 0.0
+      non_offensive_score = scores[0] if len(scores) > 0 else 1.0
+
+    label = (
+        "Offensive" if offensive_score > non_offensive_score else "Non-Offensive"
+    )
+    confidence = max(offensive_score, non_offensive_score) * 100
 
     return {
         "label": label,
         "label_id": 1 if label == "Offensive" else 0,
-        "confidence": confidence,
+        "confidence": round(confidence, 2),
         "language": lang,
         "text": text,
-        "probs": probs,
+        "probs": {
+            "non_offensive": round(non_offensive_score * 100, 2),
+            "offensive": round(offensive_score * 100, 2),
+        },
     }
 
   except Exception as e:
@@ -154,7 +171,6 @@ def predict(text: str, lang: str) -> dict:
         "text": text,
         "probs": {"non_offensive": 100.0, "offensive": 0.0},
     }
-
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
