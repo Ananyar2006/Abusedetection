@@ -1,5 +1,6 @@
-import logging
 import os
+import time
+
 import requests
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -17,13 +18,26 @@ CORS(app, origins="*")
 
 # ── Config ────────────────────────────────────────────────────────────────────
 HF_API_TOKEN = os.environ.get("HF_API_TOKEN", "")
-# Use a true multilingual XLM-RoBERTa toxicity model supporting all target languages
-HF_MODEL = "unitary/multilingual-toxic-xlm-roberta"
+
+# Models are tried in order; the first one that responds successfully is used.
+# Override with env var HF_MODELS="modelA,modelB"
+HF_MODELS = [
+    m.strip()
+    for m in os.environ.get(
+        "HF_MODELS",
+        "unitary/multilingual-toxic-xlm-roberta,"
+        "unitary/toxic-bert,"
+        "martin-ha/toxic-comment-model",
+    ).split(",")
+    if m.strip()
+]
+
+# Probability above which a text is labelled Offensive
+OFFENSIVE_THRESHOLD = float(os.environ.get("OFFENSIVE_THRESHOLD", "0.5"))
 
 SARVAM_API_KEY = os.environ.get("SARVAM_API_KEY", "")
 SARVAM_TRANSLATE_URL = "https://api.sarvam.ai/translate"
 
-# ── Language codes ─────────────────────────────────────────────────────────────
 SARVAM_LANG_CODES = {
     "hindi": "hi-IN",
     "tamil": "ta-IN",
@@ -37,159 +51,177 @@ GOOGLE_LANG_CODES = {
     "malayalam": "ml",
 }
 
+# Remembers which model last worked so we don't retry broken ones every time
+_working_model = None
+
 
 # ── Translation ────────────────────────────────────────────────────────────────
 def translate_to_english(text: str, lang: str) -> str:
-  # ── Sarvam API ─────────────────────────────────────────
-  try:
-    src_code = SARVAM_LANG_CODES.get(lang, "hi-IN")
-    resp = requests.post(
-        SARVAM_TRANSLATE_URL,
-        headers={
-            "api-subscription-key": SARVAM_API_KEY,
-            "Content-Type": "application/json",
-        },
-        json={
-            "input": text,
-            "source_language_code": src_code,
-            "target_language_code": "en-IN",
-        },
-        timeout=10,
-    )
-    data = resp.json()
-    translated = data.get("translated_text") or data.get("translation") or ""
-    if translated:
-      return translated
-  except Exception as e:
-    print("Sarvam translate error:", e)
+  # Sarvam first
+  if SARVAM_API_KEY:
+    try:
+      resp = requests.post(
+          SARVAM_TRANSLATE_URL,
+          headers={
+              "api-subscription-key": SARVAM_API_KEY,
+              "Content-Type": "application/json",
+          },
+          json={
+              "input": text,
+              "source_language_code": SARVAM_LANG_CODES.get(lang, "hi-IN"),
+              "target_language_code": "en-IN",
+          },
+          timeout=10,
+      )
+      if resp.ok:
+        data = resp.json()
+        translated = data.get("translated_text") or data.get("translation")
+        if translated:
+          return translated
+      else:
+        print(f"Sarvam HTTP {resp.status_code}: {resp.text[:200]}")
+    except Exception as e:
+      print("Sarvam translate error:", e)
 
-  # ── Fallback ───────────────────────────────────────────
+  # Fallback: Google
   if TRANSLATOR_AVAILABLE:
     try:
-      src_code = GOOGLE_LANG_CODES.get(lang, "auto")
-      return GoogleTranslator(source=src_code, target="en").translate(text)
+      src = GOOGLE_LANG_CODES.get(lang, "auto")
+      return GoogleTranslator(source=src, target="en").translate(text)
     except Exception as e:
       print("Fallback translate error:", e)
 
   return ""
 
 
-# ── Inference (Hugging Face API with Robust JSON & Error Protection) ──────────
-def predict(text: str, lang: str) -> dict:
-  url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
-
+# ── Hugging Face helpers ──────────────────────────────────────────────────────
+def call_hf(model: str, text: str, retries: int = 2):
+  """Call one HF model. Returns parsed JSON or raises RuntimeError."""
+  url = f"https://router.huggingface.co/hf-inference/models/{model}"
   headers = {
       "Authorization": f"Bearer {HF_API_TOKEN}",
       "Content-Type": "application/json",
+      "X-Wait-For-Model": "true",
   }
 
-  payload = {"inputs": text}
-
-  try:
-    response = requests.post(url, headers=headers, json=payload, timeout=30)
-
-    # If Hugging Face returns an error status code or HTML page (model loading)
-    if not response.ok:
-      print(f"Hugging Face HTTP {response.status_code}: {response.text[:200]}")
-      # Fallback response so frontend never gets a bad JSON/HTML crash
-      return {
-          "label": "Non-Offensive",
-          "label_id": 0,
-          "confidence": 95.0,
-          "language": lang,
-          "text": text,
-          "probs": {"non_offensive": 95.0, "offensive": 5.0},
-      }
-
-    # Safely try parsing JSON, catching unexpected HTML responses
-    try:
-      data = response.json()
-    except Exception as json_err:
-      print("JSON Decode Error (Received HTML/Text):", response.text[:200])
-      return {
-          "label": "Non-Offensive",
-          "label_id": 0,
-          "confidence": 95.0,
-          "language": lang,
-          "text": text,
-          "probs": {"non_offensive": 95.0, "offensive": 5.0},
-      }
-
-    # Handle model loading / error dictionaries from HF
-    if isinstance(data, dict) and ("error" in data or "estimated_time" in data):
-      print("Model is loading or busy:", data)
-      return {
-          "label": "Non-Offensive",
-          "label_id": 0,
-          "confidence": 95.0,
-          "language": lang,
-          "text": text,
-          "probs": {"non_offensive": 95.0, "offensive": 5.0},
-      }
-
-    # Extract score list safely
-    scores_list = []
-    if isinstance(data, list):
-      if len(data) > 0 and isinstance(data[0], list):
-        scores_list = data[0]
-      else:
-        scores_list = data
-    elif isinstance(data, dict) and "labels" in data and "scores" in data:
-      scores_list = [
-          {"label": l, "score": s}
-          for l, s in zip(data["labels"], data["scores"])
-      ]
-
-    # Calculate toxicity score across categories
-    max_toxicity = 0.0
-    for item in scores_list:
-      lbl = str(item.get("label", "")).strip().lower()
-      score = float(item.get("score", 0.0))
-      if any(
-          t in lbl for t in ["toxic", "insult", "obscene", "threat", "hate"]
-      ):
-        if score > max_toxicity:
-          max_toxicity = score
-
-    # Threshold for offensive classification
-    is_offensive = max_toxicity > 0.20
-    label = "Offensive" if is_offensive else "Non-Offensive"
-    label_id = 1 if is_offensive else 0
-
-    offensive_prob = round(max_toxicity * 100, 2)
-    if not is_offensive and offensive_prob > 50.0:
-      offensive_prob = round(100.0 - offensive_prob, 2)
-
-    non_offensive_prob = round(100.0 - offensive_prob, 2)
-    confidence = (
-        max(offensive_prob, non_offensive_prob)
-        if offensive_prob > 0
-        else 95.0
+  last_err = ""
+  for attempt in range(retries + 1):
+    resp = requests.post(
+        url, headers=headers, json={"inputs": text}, timeout=45
     )
 
-    return {
-        "label": label,
-        "label_id": label_id,
-        "confidence": confidence,
-        "language": lang,
-        "text": text,
-        "probs": {
-            "non_offensive": non_offensive_prob,
-            "offensive": offensive_prob,
-        },
-    }
+    if resp.status_code == 503:  # model loading
+      last_err = f"503 loading: {resp.text[:150]}"
+      time.sleep(5)
+      continue
 
-  except Exception as e:
-    print("Prediction exception:", e)
-    return {
-        "label": "Non-Offensive",
-        "label_id": 0,
-        "confidence": 95.0,
-        "language": lang,
-        "text": text,
-        "probs": {"non_offensive": 95.0, "offensive": 5.0},
-    }
-    
+    if not resp.ok:
+      raise RuntimeError(f"{model} -> HTTP {resp.status_code}: {resp.text[:200]}")
+
+    try:
+      data = resp.json()
+    except Exception:
+      raise RuntimeError(f"{model} -> non-JSON response: {resp.text[:200]}")
+
+    if isinstance(data, dict) and "error" in data:
+      raise RuntimeError(f"{model} -> {data['error']}")
+
+    return data
+
+  raise RuntimeError(f"{model} -> {last_err}")
+
+
+def extract_offensive_score(data) -> float:
+  """Turn the various HF classifier output shapes into one offensive prob."""
+  # Normalise to a flat list of {"label":..., "score":...}
+  if isinstance(data, list) and data and isinstance(data[0], list):
+    items = data[0]
+  elif isinstance(data, list):
+    items = data
+  else:
+    items = []
+
+  toxic_words = ["toxic", "insult", "obscene", "threat", "hate",
+                 "offensive", "abusive", "abuse", "attack", "identity"]
+  safe_words = ["non", "not", "neutral", "clean", "normal", "safe"]
+
+  best = 0.0
+  for item in items:
+    if not isinstance(item, dict):
+      continue
+    label = str(item.get("label", "")).strip().lower()
+    score = float(item.get("score", 0.0))
+
+    if label in ("label_1", "1"):  # generic binary head: 1 = toxic
+      best = max(best, score)
+      continue
+    if label in ("label_0", "0"):
+      continue
+    if any(label.startswith(s) or f"_{s}" in label or f"-{s}" in label
+           for s in safe_words):
+      continue  # e.g. "non-toxic", "not_offensive", "neutral"
+    if any(t in label for t in toxic_words):
+      best = max(best, score)
+
+  return best
+
+
+def score_text(text: str) -> dict:
+  """Score text with the first working model. Raises if all models fail."""
+  global _working_model
+
+  order = ([_working_model] if _working_model else []) + [
+      m for m in HF_MODELS if m != _working_model
+  ]
+
+  errors = []
+  for model in order:
+    try:
+      data = call_hf(model, text)
+      print(f"[{model}] RAW OUTPUT:", data)
+      _working_model = model
+      return {"model": model, "offensive": extract_offensive_score(data)}
+    except Exception as e:
+      print("HF error:", e)
+      errors.append(str(e))
+      if model == _working_model:
+        _working_model = None
+
+  raise RuntimeError(" | ".join(errors))
+
+
+# ── Prediction ────────────────────────────────────────────────────────────────
+def predict(text: str, lang: str, translation: str = "") -> dict:
+  # Score the original text and the English translation, keep the higher one
+  results = [("original", score_text(text))]
+  if translation and translation.strip().lower() != text.strip().lower():
+    try:
+      results.append(("translation", score_text(translation)))
+    except Exception as e:
+      print("Translation scoring failed:", e)
+
+  source, best = max(results, key=lambda r: r[1]["offensive"])
+  off_p = best["offensive"]
+  is_offensive = off_p >= OFFENSIVE_THRESHOLD
+
+  offensive_pct = round(off_p * 100, 2)
+  non_offensive_pct = round(100 - offensive_pct, 2)
+
+  return {
+      "label": "Offensive" if is_offensive else "Non-Offensive",
+      "label_id": 1 if is_offensive else 0,
+      "confidence": max(offensive_pct, non_offensive_pct),
+      "language": lang,
+      "text": text,
+      "model_used": best["model"],
+      "scored_on": source,
+      "probs": {
+          "non_offensive": non_offensive_pct,
+          "offensive": offensive_pct,
+      },
+  }
+
+
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
@@ -207,27 +239,57 @@ def health():
       "status": "ok",
       "hf_token_set": bool(HF_API_TOKEN),
       "sarvam_key_set": bool(SARVAM_API_KEY),
+      "models": HF_MODELS,
+      "active_model": _working_model,
+      "threshold": OFFENSIVE_THRESHOLD,
   })
 
 
-# ── Analyze text ──────────────────────────────────────────────────────────────
+@app.route("/debug-model")
+def debug_model():
+  """Open /debug-model?text=you%20are%20stupid to see what each model returns."""
+  text = request.args.get("text", "you are a stupid idiot")
+  report = {}
+  for model in HF_MODELS:
+    try:
+      data = call_hf(model, text, retries=1)
+      report[model] = {
+          "ok": True,
+          "raw": data,
+          "offensive_score": extract_offensive_score(data),
+      }
+    except Exception as e:
+      report[model] = {"ok": False, "error": str(e)}
+  return jsonify(report)
+
+
+def run_analysis(text: str, lang: str, extra: dict = None):
+  translation = translate_to_english(text, lang)
+  try:
+    result = predict(text, lang, translation)
+  except Exception as e:
+    return jsonify({
+        "error": "Toxicity model unavailable",
+        "details": str(e),
+    }), 502
+  result["translation"] = translation
+  if extra:
+    result.update(extra)
+  return jsonify(result)
+
+
 @app.route("/analyze-text", methods=["POST"])
 def analyze_text():
-  data = request.get_json()
-
+  data = request.get_json(silent=True) or {}
   text = data.get("text", "").strip()
   lang = data.get("language", "hindi").lower()
 
   if not text:
     return jsonify({"error": "Text is empty"}), 400
 
-  result = predict(text, lang)
-  result["translation"] = translate_to_english(text, lang)
-
-  return jsonify(result)
+  return run_analysis(text, lang)
 
 
-# ── Analyze speech (transcript-based) ─────────────────────────────────────────
 @app.route("/analyze-speech", methods=["POST"])
 def analyze_speech():
   transcript = request.form.get("transcript", "").strip()
@@ -236,11 +298,7 @@ def analyze_speech():
   if not transcript:
     return jsonify({"error": "No transcript provided"}), 400
 
-  result = predict(transcript, lang)
-  result["transcript"] = transcript
-  result["translation"] = translate_to_english(transcript, lang)
-
-  return jsonify(result)
+  return run_analysis(transcript, lang, {"transcript": transcript})
 
 
 # ── Run ───────────────────────────────────────────────────────────────────────
