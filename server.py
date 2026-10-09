@@ -111,6 +111,11 @@ def translate_to_english(text, lang):
 # --------------------------------------------------
 
 
+# --------------------------------------------------
+# REMOTE HUGGING FACE CLASSIFICATION API
+# --------------------------------------------------
+
+
 def predict(text, lang):
   if not HF_API_TOKEN:
     raise RuntimeError(
@@ -119,12 +124,9 @@ def predict(text, lang):
 
   url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
 
+  # FIXED: xlm-roberta-base is standard classification, so send ONLY inputs.
   payload = {
       "inputs": text,
-      "parameters": {
-          "candidate_labels": LABELS,
-          "hypothesis_template": "This example is {}.",
-      },
   }
 
   try:
@@ -145,13 +147,12 @@ def predict(text, lang):
 
   data = response.json()
 
-  # Handle pipeline response format safely
+  # Handle standard text-classification list responses (e.g., [[{'label': 'LABEL_1', 'score': 0.9}, ...]])
   if isinstance(data, list) and len(data) > 0:
-    scores_list = data
-  elif isinstance(data, dict) and "labels" in data:
-    labels = data.get("labels", [])
-    scores = data.get("scores", [])
-    scores_list = [{"label": l, "score": s} for l, s in zip(labels, scores)]
+    if isinstance(data[0], list):
+      scores_list = data[0]
+    else:
+      scores_list = data
   else:
     scores_list = []
 
@@ -160,8 +161,25 @@ def predict(text, lang):
       for item in scores_list
   }
 
-  offensive_score = score_map.get("offensive", 0.0)
-  non_offensive_score = score_map.get("non-offensive", 0.0)
+  # Map standard model labels (e.g., offensive/non-offensive or LABEL_1/LABEL_0)
+  offensive_score = score_map.get(
+      "offensive", score_map.get("label_1", score_map.get("1", 0.0))
+  )
+  non_offensive_score = score_map.get(
+      "non-offensive",
+      score_map.get(
+          "non_offensive", score_map.get("label_0", score_map.get("0", 0.0))
+      ),
+  )
+
+  # Fallback if labels are generic
+  if (
+      offensive_score == 0.0
+      and non_offensive_score == 0.0
+      and len(scores_list) >= 2
+  ):
+    offensive_score = scores_list[1].get("score", 0.0)
+    non_offensive_score = scores_list[0].get("score", 0.0)
 
   label = (
       "Offensive" if offensive_score > non_offensive_score else "Non-Offensive"
