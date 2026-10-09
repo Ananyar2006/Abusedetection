@@ -74,46 +74,111 @@ def translate_to_english(text: str, lang: str) -> str:
 
 # ── Inference (Hugging Face API) ──────────────────────────────────────────────
 def predict(text: str, lang: str) -> dict:
+    if not HF_API_TOKEN:
+        raise RuntimeError(
+            "HF_API_TOKEN is missing. Set it in Render Environment."
+        )
 
-    url = f"https://api-inference.huggingface.co/models/{HF_MODEL}"
+    url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
 
     headers = {
         "Authorization": f"Bearer {HF_API_TOKEN}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
     }
 
     payload = {
         "inputs": text,
         "parameters": {
             "candidate_labels": LABELS,
-            "hypothesis_template": "This example is {}."
-        }
+            "hypothesis_template": "This example is {}.",
+        },
     }
 
-    response = requests.post(url, headers=headers, json=payload)
-    data = response.json()
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=45,
+        )
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(
+            "Hugging Face timed out. Please try again."
+        ) from exc
+    except requests.exceptions.ConnectionError as exc:
+        raise RuntimeError(
+            "Could not connect to Hugging Face. "
+            "Check the API endpoint and try again."
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            "Hugging Face request failed."
+        ) from exc
+
+    if not response.ok:
+        print("Hugging Face error:", response.status_code, response.text[:500])
+
+        if response.status_code == 401:
+            message = "Hugging Face token is invalid or unauthorized."
+        elif response.status_code == 403:
+            message = "Your token lacks the required inference permission."
+        elif response.status_code == 429:
+            message = "Hugging Face rate limit or usage quota reached."
+        elif response.status_code in (404, 410):
+            message = (
+                "The model or inference route is unavailable. "
+                "Check model availability on Hugging Face."
+            )
+        else:
+            message = f"Hugging Face returned HTTP {response.status_code}."
+
+        raise RuntimeError(message)
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "Hugging Face returned an unexpected response."
+        ) from exc
+
+    # Validate the zero-shot classification response.
+    if not isinstance(data, dict):
+        raise RuntimeError(
+            f"Unexpected model response: {str(data)[:300]}"
+        )
 
     labels = data.get("labels", [])
     scores = data.get("scores", [])
 
-    label = labels[0] if labels else "Non-Offensive"
-    confidence = round(scores[0] * 100, 2) if scores else 0
+    if not labels or not scores or len(labels) != len(scores):
+        raise RuntimeError(
+            "The model did not return valid classification scores."
+        )
 
-    probs = {"non_offensive": 0, "offensive": 0}
-    for i, lbl in enumerate(labels):
-        val = round(scores[i] * 100, 2)
-        if lbl == "Non-Offensive":
-            probs["non_offensive"] = val
-        elif lbl == "Offensive":
-            probs["offensive"] = val
+    label_scores = {
+        str(label).lower(): float(score)
+        for label, score in zip(labels, scores)
+    }
+
+    offensive_score = label_scores.get("offensive", 0.0)
+    non_offensive_score = label_scores.get("non-offensive", 0.0)
+
+    label = (
+        "Offensive"
+        if offensive_score > non_offensive_score
+        else "Non-Offensive"
+    )
 
     return {
         "label": label,
         "label_id": 1 if label == "Offensive" else 0,
-        "confidence": confidence,
+        "confidence": round(max(offensive_score, non_offensive_score) * 100, 2),
         "language": lang,
         "text": text,
-        "probs": probs
+        "probs": {
+            "non_offensive": round(non_offensive_score * 100, 2),
+            "offensive": round(offensive_score * 100, 2),
+        },
     }
 
 # ── Routes ────────────────────────────────────────────────────────────────────
