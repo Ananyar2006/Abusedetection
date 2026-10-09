@@ -76,6 +76,7 @@ def translate_to_english(text: str, lang: str) -> str:
 
 # ── Inference (Hugging Face API) ──────────────────────────────────────────────
 # ── Inference (Hugging Face API) ──────────────────────────────────────────────
+# ── Inference (Hugging Face API - Model Driven) ──────────────────────────────
 def predict(text: str, lang: str) -> dict:
   url = f"https://router.huggingface.co/hf-inference/models/{HF_MODEL}"
 
@@ -91,21 +92,12 @@ def predict(text: str, lang: str) -> dict:
 
     if not response.ok:
       print(f"Hugging Face HTTP {response.status_code}: {response.text}")
-      # Fallback to prevent app crash
-      return {
-          "label": "Non-Offensive",
-          "label_id": 0,
-          "confidence": 50.0,
-          "language": lang,
-          "text": text,
-          "probs": {"non_offensive": 50.0, "offensive": 50.0},
-      }
+      raise RuntimeError(f"Hugging Face API error: {response.status_code}")
 
     data = response.json()
-    print("HF Raw Response:", data)  # Check your terminal logs to see what it returns!
 
+    # Safely extract score list from Hugging Face response structure
     scores_list = []
-    # Handle different data formats returned by Hugging Face API routers
     if isinstance(data, list):
       if len(data) > 0 and isinstance(data[0], list):
         scores_list = data[0]
@@ -113,45 +105,50 @@ def predict(text: str, lang: str) -> dict:
         scores_list = data
     elif isinstance(data, dict):
       if "labels" in data and "scores" in data:
-        scores_list = [{"label": l, "score": s} for l, s in zip(data["labels"], data["scores"])]
-      elif "error" in data:
-        print("HF Model loading or error:", data["error"])
+        scores_list = [
+            {"label": l, "score": s}
+            for l, s in zip(data["labels"], data["scores"])
+        ]
 
-    max_toxic_score = 0.0
+    # Aggregate scores across toxic, insult, obscene, and threat categories
+    max_toxicity = 0.0
+    non_toxic_score = 0.5
+
     for item in scores_list:
       lbl = str(item.get("label", "")).strip().lower()
       score = float(item.get("score", 0.0))
-      
-      # If ANY toxic/insult/obscene/hate label appears, capture its score
-      if any(t in lbl for t in ["toxic", "insult", "obscene", "threat", "hate", "offensive", "severe"]):
-        if score > max_toxic_score:
-          max_toxic_score = score
 
-    # If the model returns standard binary labels (LABEL_1 as toxic, LABEL_0 as normal)
-    if max_toxic_score == 0.0 and len(scores_list) >= 2:
-      for item in scores_list:
-        lbl = str(item.get("label", "")).strip().upper()
-        score = float(item.get("score", 0.0))
-        if lbl in ["LABEL_1", "1", "OFFENSIVE"]:
-          max_toxic_score = score
+      # Check for negative/toxic classes
+      if any(
+          t in lbl for t in ["toxic", "insult", "obscene", "threat", "hate"]
+      ):
+        if score > max_toxicity:
+          max_toxicity = score
+      # Check for normal/non-toxic classes
+      elif any(n in lbl for n in ["neutral", "normal", "non"]):
+        non_toxic_score = score
 
-    # AGGRESSIVE THRESHOLD: Lowered to 15% so slang words immediately trigger it
-    is_offensive = max_toxic_score > 0.15
+    # Model evaluation threshold: If toxicity/insult probability is greater than 20%, flag as Offensive
+    is_offensive = max_toxicity > 0.20
+
     label = "Offensive" if is_offensive else "Non-Offensive"
+    label_id = 1 if is_offensive else 0
 
-    offensive_prob = round(max_toxic_score * 100, 2)
-    # Ensure probabilities balance nicely for the UI
-    if offensive_prob == 0.0:
-      offensive_prob = 5.0
-      non_offensive_prob = 95.0
-    else:
-      non_offensive_prob = round(max(0.0, 100.0 - offensive_prob), 2)
+    # Calculate final percentage probabilities for the UI bars
+    offensive_prob = round(max_toxicity * 100, 2)
+    if not is_offensive and offensive_prob > 50.0:
+      offensive_prob = round(100.0 - offensive_prob, 2)
 
-    confidence = offensive_prob if is_offensive else non_offensive_prob
+    non_offensive_prob = round(100.0 - offensive_prob, 2)
+    confidence = (
+        max(offensive_prob, non_offensive_prob)
+        if offensive_prob > 0
+        else 95.0
+    )
 
     return {
         "label": label,
-        "label_id": 1 if is_offensive else 0,
+        "label_id": label_id,
         "confidence": confidence,
         "language": lang,
         "text": text,
@@ -162,17 +159,9 @@ def predict(text: str, lang: str) -> dict:
     }
 
   except Exception as e:
-    print("Prediction exception:", e)
-    return {
-        "label": "Non-Offensive",
-        "label_id": 0,
-        "confidence": 0.0,
-        "language": lang,
-        "text": text,
-        "probs": {"non_offensive": 100.0, "offensive": 0.0},
-    }
-
-
+    print("Model prediction exception:", e)
+    raise RuntimeError(f"Prediction failed: {str(e)}")
+    
 # ── Routes ────────────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
